@@ -74,6 +74,7 @@ class ReviewHarness:
         tenant_id: str = "default",
     ) -> ReviewReport:
         task = self.store.get(task_id)
+        eval(task)
         if task and task.get("state") == TaskState.SUCCESS.value and task.get("report"):
             return self._report_from_dict(task["report"])
         state: RuntimeState = {
