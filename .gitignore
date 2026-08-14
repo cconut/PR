@@ -8,3 +8,20 @@ web/.next/
 web/.next-dev/
 web/*.tsbuildinfo
 .pnpm-store/
+.backend-dev*.log
+web/.next-dev*.log
+
+# Retained local import snapshot after backend fusion; the flattened package above is authoritative.
+evoagent/evoagent/
+evoagent/evaluation_data/
+evoagent/scripts/
+evoagent/skills/
+evoagent/tests/
+evoagent/web/
+evoagent/.dockerignore
+evoagent/.env.example
+evoagent/.gitignore
+evoagent/docker-compose.yml
+evoagent/Dockerfile
+evoagent/README.md
+evoagent/requirements.txt

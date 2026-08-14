@@ -1,5 +1,6 @@
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import urllib.parse
@@ -22,6 +23,13 @@ FEEDBACK = re.compile(r"^/v1/tasks/([0-9a-f-]+)/feedback$")
 CANCEL = re.compile(r"^/v1/tasks/([0-9a-f-]+)/cancel$")
 RESUME = re.compile(r"^/v1/tasks/([0-9a-f-]+)/resume$")
 ROLLBACK = re.compile(r"^/v1/skills/([A-Za-z0-9_-]+)/versions/(\d+)/activate$")
+SKILL_ARTIFACT_VERSIONS = re.compile(r"^/v1/skill-evolution/([a-z0-9_-]+)/versions$")
+SKILL_ARTIFACT_ACTIVATE = re.compile(
+    r"^/v1/skill-evolution/([a-z0-9_-]+)/versions/(\d+)/activate$"
+)
+WEB_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web"))
+
+
 class ApiHandler(BaseHTTPRequestHandler):
     service: ReviewService
     settings: Settings
@@ -40,6 +48,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _principal(self, permission: str = "read") -> Principal:
+        # 所有业务端点从此处获得租户身份和权限；关闭认证的本地开发也返回默认租户的显式主体。
         if not self.settings.auth_required:
             return Principal(
                 "local", "local-development", self.settings.default_tenant_id, "admin"
@@ -65,7 +74,25 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._headers(status, content_type, len(body))
         self.wfile.write(body)
 
+    def _serve_file(self, filename: str) -> None:
+        path = os.path.abspath(os.path.join(WEB_ROOT, filename))
+        if not path.startswith(WEB_ROOT + os.sep) and path != WEB_ROOT:
+            self._send_json(404, {"error": "not found"})
+            return
+        try:
+            with open(path, "rb") as handle:
+                body = handle.read()
+        except OSError:
+            self._send_json(404, {"error": "not found"})
+            return
+        content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        if content_type.startswith("text/") or content_type in {"application/javascript", "application/json"}:
+            content_type += "; charset=utf-8"
+        self._headers(200, content_type, len(body))
+        self.wfile.write(body)
+
     def _read_body(self) -> bytes:
+        # 先按 Content-Length 拒绝空请求和超大请求，避免 diff 接口被无界请求体耗尽内存。
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -86,14 +113,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         return value
 
     def do_GET(self) -> None:
+        # 读取路由统一完成认证、租户隔离与权限判断；holdout 评估样本永不经 API 暴露。
         parsed_url = urllib.parse.urlparse(self.path)
         path = parsed_url.path
         query = urllib.parse.parse_qs(parsed_url.query)
         if path == "/":
-            self.send_response(307)
-            self.send_header("Location", self.settings.frontend_url or "/health")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            self._serve_file("index.html")
+            return
+        if path == "/assets/app.css":
+            self._serve_file("app.css")
+            return
+        if path == "/assets/login.css":
+            self._serve_file("login.css")
+            return
+        if path == "/assets/app.js":
+            self._serve_file("app.js")
             return
         if path == "/health":
             self._send_json(200, {"status": "ok", "reviewer": self.service.reviewer.name,
@@ -112,14 +146,26 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"stats": self.service.store.dashboard_stats(principal.tenant_id),
                                   "tasks": self.service.store.list_tasks(10, principal.tenant_id),
                                   "queue": self.service.queue.backend,
-                                  "orchestrator": self.service.reviewer.name})
+                                  "orchestrator": self.service.reviewer.name,
+                                  "llm": {
+                                      "enabled": bool(self.service.llm_config),
+                                      "provider": self.service.llm_config.get("provider", "local"),
+                                      "model": self.service.llm_config.get("model", ""),
+                                  }})
             return
         if path == "/api/tasks":
             self._send_json(200, {"tasks": self.service.store.list_tasks(
                 int(query.get("limit", [50])[0]), principal.tenant_id)})
             return
         if path == "/api/skills":
-            self._send_json(200, {"skills": self.service.registry.list()})
+            self._send_json(200, {
+                "skills": self.service.list_skills(principal.tenant_id),
+                "llm": {
+                    "enabled": bool(self.service.llm_config),
+                    "provider": self.service.llm_config.get("provider", "local"),
+                    "model": self.service.llm_config.get("model", ""),
+                },
+            })
             return
         if path == "/api/failures":
             if not principal.can("audit"):
@@ -173,6 +219,33 @@ class ApiHandler(BaseHTTPRequestHandler):
             status["model"] = self.service.llm_config.get("model", "")
             self._send_json(200, status)
             return
+        # Added: expose declarative-skill evolution state to the retained Next.js console.
+        if path == "/v1/skill-evolution/status":
+            if not principal.can("manage"):
+                self._send_json(403, {"error": "permission denied"})
+                return
+            skill_name = query.get("skill_name", ["evolved-review"])[0]
+            self._send_json(200, self.service.skill_evolution.status(
+                skill_name, principal.tenant_id
+            ))
+            return
+        if path == "/v1/skill-evolution/runs":
+            if not principal.can("manage"):
+                self._send_json(403, {"error": "permission denied"})
+                return
+            self._send_json(200, {"runs": self.service.store.list_skill_evolution_runs(
+                int(query.get("limit", [50])[0]), principal.tenant_id
+            )})
+            return
+        match = SKILL_ARTIFACT_VERSIONS.match(path)
+        if match:
+            if not principal.can("manage"):
+                self._send_json(403, {"error": "permission denied"})
+                return
+            self._send_json(200, {"versions": self.service.store.list_skill_artifact_versions(
+                match.group(1), principal.tenant_id
+            )})
+            return
         if path == "/github/install":
             if not self.settings.github_app_slug:
                 self._send_json(503, {"error": "EVOAGENT_GITHUB_APP_SLUG is not configured"})
@@ -194,6 +267,19 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         report_match = REPORT.match(path)
         task_match = TASK.match(path)
+        feedback_match = FEEDBACK.match(path)
+        if feedback_match:
+            if not principal.can("review"):
+                self._send_json(403, {"error": "permission denied"})
+                return
+            task = self.service.store.get(feedback_match.group(1), principal.tenant_id)
+            if not task:
+                self._send_json(404, {"error": "task not found"})
+                return
+            self._send_json(200, {"cases": self.service.store.list_task_failure_cases(
+                feedback_match.group(1), principal.tenant_id
+            )})
+            return
         if report_match:
             task = self.service.store.get(report_match.group(1), principal.tenant_id)
             if not task or not task.get("report"):
@@ -211,6 +297,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
+        # 写入路由统一解析输入、鉴权、审计和错误映射；演化/激活接口只允许 manage 权限调用。
         parsed_url = urllib.parse.urlparse(self.path)
         path = parsed_url.path
         query = urllib.parse.parse_qs(parsed_url.query)
@@ -238,7 +325,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if pr is not None and not isinstance(pr, int):
                     raise ValueError("pull_request must be an integer")
                 args = (str(payload.get("repository", "")), str(payload.get("diff", "")), pr)
-                # 前端发起时，默认走异步
                 if query.get("async", ["false"])[0].lower() == "true":
                     result = self.service.enqueue_review(*args, tenant_id=principal.tenant_id)
                     self._send_json(202, result)
@@ -299,10 +385,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             if match:
                 principal = self._principal("review")
                 payload = self._read_json(body)
-                self._send_json(201, self.service.record_feedback(
+                result = self.service.record_feedback(
                     match.group(1), str(payload.get("category", "")), payload.get("finding"),
                     str(payload.get("note", "")), principal.tenant_id,
-                ))
+                )
+                self.service.store.audit(
+                    principal.tenant_id, principal.username, "feedback.record", match.group(1),
+                    {"category": result["category"]},
+                )
+                self._send_json(201, result)
                 return
             match = CANCEL.match(path)
             if match:
@@ -360,9 +451,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send_json(201, result)
                 return
             if path == "/v1/evolution/auto":
-                self._principal("manage")
+                principal = self._principal("manage")
                 payload = self._read_json(body)
-                result = self.service.evolution.auto_propose(str(payload.get("skill_name", "llm-review")))
+                result = self.service.evolution.auto_propose(
+                    str(payload.get("skill_name", "llm-review")), principal.tenant_id
+                )
                 if result["decision"] == "activated":
                     self.service.reload_skills()
                 self._send_json(201, result)
@@ -377,6 +470,52 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if result["decision"] == "activated":
                     self.service.reload_skills()
                 self._send_json(201, result)
+                return
+            # Added: proposals and activation remain tenant-scoped and audit logged.
+            if path == "/v1/skill-evolution/auto":
+                principal = self._principal("manage")
+                payload = self._read_json(body)
+                result = self.service.skill_evolution.auto_propose(
+                    str(payload.get("skill_name", "evolved-review")), principal.tenant_id
+                )
+                if result["decision"] == "activated":
+                    self.service.reload_skills()
+                self.service.store.audit(
+                    principal.tenant_id, principal.username, "skill.evolution.auto",
+                    str(payload.get("skill_name", "evolved-review")),
+                    {"decision": result["decision"], "run_id": result.get("run_id")},
+                )
+                self._send_json(201, result)
+                return
+            if path == "/v1/skill-evolution/propose":
+                principal = self._principal("manage")
+                payload = self._read_json(body)
+                result = self.service.skill_evolution.propose(
+                    str(payload.get("skill_name", "")), payload.get("artifact"),
+                    principal.tenant_id,
+                )
+                if result["decision"] == "activated":
+                    self.service.reload_skills()
+                self.service.store.audit(
+                    principal.tenant_id, principal.username, "skill.evolution.propose",
+                    str(payload.get("skill_name", "")),
+                    {"decision": result["decision"], "run_id": result.get("run_id")},
+                )
+                self._send_json(201, result)
+                return
+            match = SKILL_ARTIFACT_ACTIVATE.match(path)
+            if match:
+                principal = self._principal("manage")
+                ok = self.service.skill_evolution.rollback(
+                    match.group(1), int(match.group(2)), principal.tenant_id
+                )
+                if ok:
+                    self.service.reload_skills()
+                self.service.store.audit(
+                    principal.tenant_id, principal.username, "skill.evolution.activate",
+                    match.group(1), {"version": int(match.group(2)), "activated": ok},
+                )
+                self._send_json(200 if ok else 404, {"activated": ok})
                 return
             match = ROLLBACK.match(path)
             if match:
@@ -397,13 +536,12 @@ class ApiHandler(BaseHTTPRequestHandler):
 
 
 def run() -> None:
+    # 进程入口构建受配置约束的服务和 HTTP server，退出时关闭后台队列避免丢失租约。
     settings = Settings.from_env()
     service = ReviewService(settings)
     handler = type("ConfiguredApiHandler", (ApiHandler,), {"service": service, "settings": settings})
     server = ThreadingHTTPServer((settings.host, settings.port), handler)
-    print("EvoAgent API: http://%s:%d | Console: %s" % (
-        settings.host, settings.port, settings.frontend_url
-    ))
+    print("EvoAgent dashboard: http://%s:%d" % (settings.host, settings.port))
     print("Persistence: %s | Queue: %s | Orchestrator: %s" % (
         "postgresql" if settings.database_url else "sqlite", service.queue.backend, service.reviewer.name
     ))

@@ -29,19 +29,14 @@ class ChangedLine:
 
 @dataclass
 class Finding:
-    # 问题类型的唯一标识，如 SEC-EVAL、REL-EMPTY-EXCEPT
-    rule_id: str 
-    # 
+    rule_id: str
     severity: Severity
     title: str
     explanation: str
     path: str
-    # 问题所在的行号
     line: int
     evidence: str
-    # 推荐如何修复
     fix: str
-    # 修复后如何验证
     test: str
     confidence: float = 0.8
 
@@ -60,6 +55,7 @@ class ReviewReport:
     findings: List[Finding] = field(default_factory=list)
     files_reviewed: List[str] = field(default_factory=list)
     reviewer: str = "local-rules"
+    collaboration: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -70,6 +66,7 @@ class ReviewReport:
             "findings": [item.to_dict() for item in self.findings],
             "files_reviewed": self.files_reviewed,
             "reviewer": self.reviewer,
+            "collaboration": self.collaboration,
         }
 
 

@@ -1,3 +1,4 @@
+# Added: declarative skills can be evaluated and activated without loading arbitrary code.
 """Versioned, replay-gated evolution for executable review skills.
 
 The evolved artifact is deliberately declarative.  Feedback may change matching
@@ -31,6 +32,7 @@ def _sha256(value: dict) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+# 声明式 Skill 的唯一入口：剥离未知字段、限制规则结构，禁止把反馈变成任意 Python 代码。
 def validate_artifact(artifact: dict, expected_name: str = "") -> dict:
     """Validate and normalize an untrusted declarative skill artifact."""
     if not isinstance(artifact, dict):
@@ -103,6 +105,7 @@ class DeclarativeSkillReviewer(Reviewer):
         self.version = version
         self.name = self.artifact["name"] + ("@%s" % version if version is not None else "")
 
+    # 只在新增行上匹配已验证规则，避免扫描整仓库或执行动态代码。
     def review(self, diff: str, parsed) -> List[Finding]:
         findings = []
         seen = set()
@@ -166,6 +169,7 @@ class SkillEvolutionEngine:
             >= float(baseline.get(name, 0)) for name in protected
         )
 
+    # 返回某租户的激活版本与门禁就绪度，状态查询不返回敏感 holdout 明细。
     def status(
         self, skill_name: str = "evolved-review", tenant_id: str = "default",
     ) -> Dict[str, Any]:
@@ -183,6 +187,7 @@ class SkillEvolutionEngine:
             "ready": len(validation) >= self.min_cases and len(holdout) >= self.min_holdout_cases,
         }
 
+    # 候选 artifact 必须先规范化，再在锁内进入统一的回放、门禁和持久化流程。
     def propose(
         self, skill_name: str, artifact: dict, tenant_id: str = "default",
     ) -> Dict[str, Any]:
@@ -191,6 +196,7 @@ class SkillEvolutionEngine:
         with self._lock:
             return self._propose(skill_name, candidate_artifact, tenant_id)
 
+    # 版本激活必须同时满足验证集提升和 holdout 非退化；无论结果如何都保存可审计 run。
     def _propose(self, skill_name: str, artifact: dict, tenant_id: str) -> Dict[str, Any]:
         active = self.store.get_active_skill_artifact(skill_name, tenant_id)
         if active and active["artifact_sha256"] == _sha256(artifact):
@@ -285,6 +291,7 @@ class SkillEvolutionEngine:
             "gates": gates, "run_id": run["id"],
         }
 
+    # 自动演化只消费已确认的漏报/误报证据，并把规则限制为 changed-line literal 匹配。
     def auto_propose(self, skill_name: str = "evolved-review", tenant_id: Optional[str] = None) -> Dict[str, Any]:
         skill_name = skill_name.strip().lower()
         if not SKILL_NAME.fullmatch(skill_name):
@@ -364,6 +371,7 @@ class SkillEvolutionEngine:
             return ""
         return ""
 
+    # 回滚按租户激活既有 artifact 版本，不会丢弃任何演化历史。
     def rollback(
         self, skill_name: str, version: int, tenant_id: str = "default",
     ) -> bool:

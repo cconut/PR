@@ -1,3 +1,4 @@
+# Added: durable tenant-scoped memory separates transient and reusable review knowledge.
 """Tenant-aware working, episodic and semantic memory for review agents."""
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -28,6 +29,7 @@ class MemoryManager:
         self.recall_limit = max(1, recall_limit)
         self.working_ttl_seconds = max(60, working_ttl_seconds)
 
+    # 写入记忆时固定租户、仓库、作用域和过期时间，防止跨租户或无限期工作记忆泄漏。
     def remember(
         self, tenant_id: str, repository: str, scope: str, kind: str,
         content: str, metadata: Optional[Dict[str, Any]] = None,
@@ -62,6 +64,7 @@ class MemoryManager:
         }
         return self.store.save_agent_memory(record)
 
+    # 召回只查询当前租户与仓库，并在查询前清理过期 working memory。
     def recall(
         self, tenant_id: str, repository: str, query: str,
         scopes: Sequence[str] = ("semantic", "episodic"),
@@ -101,6 +104,7 @@ class MemoryManager:
             key=lambda item: (-item["recall_score"], item.get("created_at", "")),
         )[:size]
 
+    # 将已验证 Finding 转成可复用语义记忆；未经验证的模型输出不会直接沉淀。
     def remember_finding(
         self, tenant_id: str, repository: str, task_id: str,
         finding: Dict[str, Any], approved: bool, reasons: Iterable[str] = (),
@@ -121,6 +125,7 @@ class MemoryManager:
             importance=0.8 if approved else 0.45,
         )
 
+    # 人工反馈作为高价值记忆保存，为后续 Prompt 与 Skill 演化提供可追溯信号。
     def remember_feedback(
         self, tenant_id: str, repository: str, task_id: str, category: str,
         finding: Optional[Dict[str, Any]], note: str,
@@ -136,11 +141,13 @@ class MemoryManager:
             importance=0.95 if category in {"false_positive", "missed_issue", "bad_fix"} else 0.7,
         )
 
+    # 任务结束后主动释放临时 working memory，避免短期上下文长期累积。
     def forget_working(self, task_id: str) -> int:
         if not self.enabled:
             return 0
         return self.store.delete_agent_memories(task_id=task_id, scope="working")
 
+    # 将任务摘要归档为 episodic memory 后再删除临时记录，保留经验但控制存储规模。
     def consolidate_task(
         self, tenant_id: str, repository: str, task_id: str,
         summary: Dict[str, Any],

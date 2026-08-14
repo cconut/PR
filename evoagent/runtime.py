@@ -1,3 +1,4 @@
+# Added: dependency-free runtime for bounded, resumable agent execution.
 """EvoAgent's dependency-free durable runtime and bounded agent loop.
 
 The runtime deliberately separates orchestration from agent behaviour:
@@ -10,6 +11,8 @@ The runtime deliberately separates orchestration from agent behaviour:
 Both components are deterministic around side effects.  Persistence remains in
 the application store so a worker restart does not depend on a framework-owned
 checkpoint format.
+
+
 """
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -52,6 +55,7 @@ class ToolRegistry:
         for tool in tools:
             self.register(tool)
 
+    # 工具只能通过注册表进入 Agent Loop，名称唯一性阻止模型伪造或覆盖已有能力。
     def register(self, tool: AgentTool) -> None:
         if not tool.name or tool.name in self._tools:
             raise ValueError("tool names must be non-empty and unique")
@@ -60,9 +64,11 @@ class ToolRegistry:
     def names(self) -> List[str]:
         return sorted(self._tools)
 
+    # 只暴露声明过的工具 schema，供模型选择动作；handler 本身不会泄露给模型。
     def catalog(self) -> List[Dict[str, Any]]:
         return [self._tools[name].catalog_entry() for name in self.names()]
 
+    # 每次工具调用先做白名单与参数校验，再执行 handler，避免自由文本直接触达运行环境。
     def invoke(self, name: str, arguments: Dict[str, Any]) -> Any:
         tool = self._tools.get(name)
         if tool is None:
@@ -71,6 +77,7 @@ class ToolRegistry:
         return tool.handler(**arguments)
 
     @staticmethod
+    # 参数校验同时限制必填字段、未知字段、类型和数值范围，失败即中断本次工具调用。
     def _validate(schema: Dict[str, Any], arguments: Dict[str, Any]) -> None:
         if not isinstance(arguments, dict):
             raise AgentLoopProtocolError("tool arguments must be an object")
@@ -141,6 +148,7 @@ class AgentRuntime:
         self.timeout_seconds = timeout_seconds
         self.node_retries = node_retries
 
+    # 所有节点必须从此入口运行：每轮强制检查取消、步数和时间预算，并写入 checkpoint 与事件。
     def execute(
         self, initial_state: Dict[str, Any], nodes: Iterable[RuntimeNode],
         task_id: str = "", checkpoint_store=None,
@@ -246,6 +254,7 @@ class AgentLoop:
         self.timeout_seconds = timeout_seconds
         self.max_observation_chars = max(256, max_observation_chars)
 
+    # Agent Loop 只接受 final 或已注册 tool 动作；循环步数与超时由运行时预算硬性限制。stepper就是 agent.agent_step(state)。
     def run(
         self, stepper: Callable[[Dict[str, Any]], Dict[str, Any]],
         tools: Any, initial_state: Dict[str, Any],

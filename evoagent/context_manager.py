@@ -1,3 +1,4 @@
+# Added: bounded context construction preserves risk evidence when a diff is large.
 """Token-aware deterministic context construction for PR review agents."""
 from dataclasses import asdict, dataclass, field
 import hashlib
@@ -76,6 +77,7 @@ class ContextManager:
         # A conservative dependency-free estimate for mixed source code and text.
         return max(1, (len(text.encode("utf-8")) + 3) // 4)
 
+    # 先按风险词和 diff hunk 构建基础上下文；超预算时保留新增行证据并压缩无关内容。
     def build(
         self, diff: str, assignment: Dict[str, Any] = None,
         memories: Sequence[Dict[str, Any]] = (),
@@ -144,6 +146,7 @@ class ContextManager:
             strategy="risk-ranked-hunk-compression", source_sha256=digest,
         )
 
+    # 每一轮 Agent Loop 都通过这里合并任务、工具观察、反馈与记忆，保证上下文总量受预算约束。
     def compose(
         self, diff_bundle: ContextBundle, assignment: Dict[str, Any],
         feedback: Sequence[Any] = (), inbox: Sequence[Dict[str, Any]] = (),
@@ -282,6 +285,7 @@ class ContextManager:
             for value in values if len(value) >= 3
         }
 
+    # 将统一 diff 切成可排序 hunk，后续压缩只能丢弃上下文，不能丢失风险新增行。
     def _parse(self, diff: str, terms: set) -> Tuple[Dict[str, str], List[_Hunk]]:
         lines = diff.splitlines(True)
         files: List[Tuple[str, List[str]]] = []
@@ -334,6 +338,7 @@ class ContextManager:
         return score
 
     @staticmethod
+    # hunk 过大时按风险优先级裁剪，并插入明确标记，防止模型误以为上下文完整。
     def _compact_hunk(hunk: _Hunk, byte_budget: int, terms: set) -> str:
         if byte_budget < 128:
             return ""
@@ -378,6 +383,7 @@ class ContextManager:
         return "".join(output)
 
 
+# 记忆以不可信的只读文本渲染，并截断到固定长度，避免历史内容突破当前上下文预算。
 def render_memories(memories: Iterable[Dict[str, Any]], max_chars: int = 5000) -> str:
     """Render recalled memory as untrusted, compact runtime context."""
     lines = []

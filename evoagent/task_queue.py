@@ -28,13 +28,11 @@ class TaskQueue:
         self.max_attempts = max_attempts
         self.lease_seconds = lease_seconds
         self.on_dead_letter = on_dead_letter
-        # 后台线程池
         self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="evoagent-worker")
         self._redis = None
         self._memory: queue.Queue = queue.Queue()
         self._memory_dlq = []
         self._lock = threading.Lock()
-        # 停止worker
         self._stop = threading.Event()
         self.consumer = "%s-%s" % (socket.gethostname(), uuid.uuid4().hex[:8])
         if redis_url:
@@ -56,7 +54,6 @@ class TaskQueue:
     def backend(self) -> str:
         return "redis-streams" if self._redis else "memory-acked"
 
-    # 将任务提交给后台线程池
     def submit(self, payload: Dict[str, Any], message_id: str = "") -> str:
         envelope = {
             "message_id": message_id or str(payload.get("task_id") or uuid.uuid4()),
@@ -69,10 +66,9 @@ class TaskQueue:
         else:
             self._executor.submit(self._deliver, envelope)
         return envelope["message_id"]
-    
-    # 包一层重试/失败处理后，调用消费者
+
     def _deliver(self, envelope: Dict[str, Any]) -> bool:
-        envelope["attempt"] = int(envelope.get("attempt", 0)) + 1  
+        envelope["attempt"] = int(envelope.get("attempt", 0)) + 1
         try:
             self.handler(envelope["payload"])
             return True

@@ -1,22 +1,4 @@
 """Versioned skill registry with manifest validation and process isolation."""
-# 它负责把外部审查规则当成可插拔 Skill 加载、校验、隔离执行，再把输出转换回统一的 Finding
-'''
-服务启动
-→ 创建空的 SkillRegistry
-→ 注册 Security / Reliability / LLM 这三个内置 Reviewer
-→ 扫描 skills/ 目录
-→ 找到 code-quality/skill.py
-→ 创建 SandboxedSkillReviewer
-→ 注册 code-quality
-→ 把所有 Reviewer 交给 Coordinator
-
-某次 PR 审查
-→ Coordinator 调用 code-quality.review(diff, parsed)
-→ SandboxedSkillReviewer 启动独立子进程
-→ 子进程执行真正的 skill.py
-→ 返回 Finding
-
-'''
 import ast
 import hashlib
 import hmac
@@ -48,8 +30,9 @@ class SkillInfo:
     sandboxed: bool = False
     permissions: tuple = ()
 
-# 审查时隔离执行这个skill
+
 class SandboxedSkillReviewer(Reviewer):
+    # 审查时隔离执行这个 Skill：收窄环境变量、临时工作目录、超时和内存限制，禁止直接访问宿主资源。
     def __init__(
         self, name: str, module_path: str, timeout_seconds: int = 30,
         memory_mb: int = 256, container_image: str = "",
@@ -62,6 +45,7 @@ class SandboxedSkillReviewer(Reviewer):
         self.runner = os.path.join(os.path.dirname(__file__), "skill_runner.py")
 
     def review(self, diff, parsed) -> List[Finding]:
+        # 将内部 diff 转为稳定 JSON 协议，子进程输出必须重新解析成统一 Finding，不能直接信任。
         payload = {
             "diff": diff,
             "parsed": {
@@ -119,6 +103,7 @@ class SandboxedSkillReviewer(Reviewer):
 
 
 class SkillRegistry:
+    # 外部审查规则作为可插拔 Skill 加载、校验、隔离执行，再转换回统一的 Finding。
     def __init__(
         self, skills_dir: str, sandbox: bool = True, timeout_seconds: int = 30,
         memory_mb: int = 256, signing_key: str = "",
@@ -142,7 +127,7 @@ class SkillRegistry:
         if not name.replace("-", "_").isidentifier():
             raise ValueError("invalid skill name: %s" % name)
         with self._lock:
-            self._skills[name] = reviewer   
+            self._skills[name] = reviewer
             self._info[name] = SkillInfo(
                 name, version, description, source, sandboxed, permissions
             )
@@ -150,6 +135,11 @@ class SkillRegistry:
     def reviewers(self) -> List[Reviewer]:
         with self._lock:
             return list(self._skills.values())
+
+    def unregister(self, name: str) -> None:
+        with self._lock:
+            self._skills.pop(name, None)
+            self._info.pop(name, None)
 
     def list(self) -> List[dict]:
         with self._lock:
@@ -160,12 +150,11 @@ class SkillRegistry:
                 values.append(value)
             return values
 
-    # 负责发现并加载动态skill
     def reload(self) -> List[dict]:
+        # 扫描 skills/*/skill.json；每次加载前都校验入口路径、清单、校验和与静态导入白名单。
         if not os.path.isdir(self.skills_dir):
             os.makedirs(self.skills_dir, exist_ok=True)
             return self.list()
-        # 扫描 skills/*/skill.json
         for entry in os.scandir(self.skills_dir):
             if not entry.is_dir():
                 continue
@@ -177,7 +166,6 @@ class SkillRegistry:
             module_path = os.path.abspath(os.path.join(entry.path, manifest.get("entrypoint", "")))
             if not module_path.startswith(os.path.abspath(entry.path) + os.sep):
                 raise ValueError("skill entrypoint escapes its directory: %s" % entry.name)
-            # manifest是json的内容,module_path是skill.py的路径,校验manifest的内容和skill.py的sha256是否匹配
             self._validate_manifest(manifest, module_path)
             reviewer = SandboxedSkillReviewer(
                 manifest["name"], module_path, self.timeout_seconds, self.memory_mb,
@@ -192,8 +180,8 @@ class SkillRegistry:
             )
         return self.list()
 
-    # 加载skill前校验这个skill 是否可信,格式是否正确
     def _validate_manifest(self, manifest: dict, module_path: str) -> None:
+        # Skill 没有宿主权限；签名、内容哈希和禁用导入三项校验缺一不可。
         for field in ("name", "version", "entrypoint", "sha256", "permissions"):
             if field not in manifest:
                 raise ValueError("skill manifest is missing %s" % field)

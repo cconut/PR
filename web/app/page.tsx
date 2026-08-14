@@ -79,6 +79,7 @@ type FailureCase = {
 
 type EvolutionRun = {
   id: string;
+  skill_name?: string;
   candidate_version: number;
   decision: string;
   candidate_score: number;
@@ -205,6 +206,9 @@ export default function ConsolePage() {
   const [taskDetailLoading, setTaskDetailLoading] = useState(false);
   const [skills, setSkills] = useState<Skill[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(false);
+  const [skillEvolutionStatus, setSkillEvolutionStatus] = useState<unknown>(null);
+  const [skillEvolutionRuns, setSkillEvolutionRuns] = useState<EvolutionRun[]>([]);
+  const [skillEvolutionResult, setSkillEvolutionResult] = useState<unknown>(null);
   const [evolutionStatus, setEvolutionStatus] = useState<unknown>(null);
   const [failures, setFailures] = useState<FailureCase[]>([]);
   const [runs, setRuns] = useState<EvolutionRun[]>([]);
@@ -275,8 +279,15 @@ export default function ConsolePage() {
   const loadSkills = useCallback(async () => {
     setSkillsLoading(true);
     try {
-      const data = await request<{ skills: Skill[] }>("/api/skills");
+      // Added: load declarative skill evolution beside the existing Skill registry.
+      const [data, statusData, runData] = await Promise.all([
+        request<{ skills: Skill[] }>("/api/skills"),
+        request<unknown>("/v1/skill-evolution/status"),
+        request<{ runs: EvolutionRun[] }>("/v1/skill-evolution/runs?limit=5"),
+      ]);
       setSkills(data.skills || []);
+      setSkillEvolutionStatus(statusData);
+      setSkillEvolutionRuns(runData.runs || []);
     } catch (error) {
       setToast(errorMessage(error));
     } finally {
@@ -400,6 +411,43 @@ export default function ConsolePage() {
       });
       await loadSkills();
       setToast("Skills 已重新加载");
+    } catch (error) {
+      setToast(errorMessage(error));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  // Added: derive a safe declarative candidate from unresolved review feedback.
+  const autoEvolveSkill = async () => {
+    setBusy("skill-evolution");
+    try {
+      const result = await request<unknown>("/v1/skill-evolution/auto", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ skill_name: "evolved-review" }),
+      });
+      setSkillEvolutionResult(result);
+      setToast("Skill evolution completed");
+      await loadSkills();
+    } catch (error) {
+      setSkillEvolutionResult({ error: errorMessage(error) });
+    } finally {
+      setBusy("");
+    }
+  };
+
+  // Added: make a previously evaluated skill version active after an operator review.
+  const activateSkillVersion = async (skillName: string, version: number) => {
+    setBusy(`skill-activate-${version}`);
+    try {
+      await request(`/v1/skill-evolution/${encodeURIComponent(skillName)}/versions/${version}/activate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      setToast(`Activated ${skillName} v${version}`);
+      await loadSkills();
     } catch (error) {
       setToast(errorMessage(error));
     } finally {
@@ -641,6 +689,27 @@ export default function ConsolePage() {
                   <span className={skill.sandboxed ? "sandbox yes" : "sandbox"}><i />{skill.sandboxed ? "Sandboxed" : "Built-in"}</span>
                 </div>
               )) : <EmptyState title="尚未加载 Skill" detail="重新扫描目录以加载可用能力" />}
+            </section>
+            {/* Added: preserve the existing registry while surfacing the new rule-evolution workflow. */}
+            <section className="surface registry">
+              <div className="surface-header">
+                <div><span className="kicker">DECLARATIVE SKILL EVOLUTION</span><h3>Skill evolution</h3></div>
+                <button className="button secondary" disabled={busy === "skill-evolution"} onClick={() => void autoEvolveSkill()}>
+                  {busy === "skill-evolution" ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}Auto propose
+                </button>
+              </div>
+              <pre className="json-viewer">{skillEvolutionStatus ? formatJson(skillEvolutionStatus) : "No skill evolution status yet."}</pre>
+              <div className="registry-head"><span>Skill</span><span>Candidate</span><span>Decision</span><span>Score</span><span>Action</span></div>
+              {skillEvolutionRuns.length ? skillEvolutionRuns.map((run) => (
+                <div className="registry-row" key={run.id}>
+                  <span className="skill-name"><span className="skill-icon"><TestTube2 size={16} /></span><strong>{run.skill_name || "evolved-review"}</strong></span>
+                  <code>v{run.candidate_version}</code>
+                  <span>{run.decision}</span>
+                  <code>{Number(run.candidate_score).toFixed(3)} / {Number(run.baseline_score).toFixed(3)}</code>
+                  <button className="inline-link" disabled={busy === `skill-activate-${run.candidate_version}`} onClick={() => void activateSkillVersion(run.skill_name || "evolved-review", run.candidate_version)}>Activate</button>
+                </div>
+              )) : <EmptyState title="No evaluated skill candidates" detail="Create a review feedback case, then run auto propose." />}
+              {skillEvolutionResult ? <pre className="json-viewer">{formatJson(skillEvolutionResult)}</pre> : null}
             </section>
           </div>
         ) : null}

@@ -4,7 +4,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Optional
 
-# 上下文变量，针对不同异步任务互相隔离
+
+# 上下文变量，针对不同异步任务互相隔离，避免一个任务的 trace id 串到另一个请求。
 trace_id_var: ContextVar[str] = ContextVar("trace_id", default="")
 logger = logging.getLogger("evoagent")
 
@@ -25,14 +26,13 @@ class Observability:
             self.tracer = trace.get_tracer(service_name)
         except ImportError:
             self.tracer = None
-    # 上下文管理器，把普通函数改造成with认识的样子。
+
     @contextmanager
     def span(self, name: str, trace_id: str = "", **attributes):
+        # 上下文管理器：有 OpenTelemetry 时记录 span/异常/属性；缺少依赖时仍保证 trace 上下文正确回收。
         token = trace_id_var.set(trace_id or trace_id_var.get())
-        if self.tracer: 
-            # 启动一个span
+        if self.tracer:
             with self.tracer.start_as_current_span(name) as span:
-                # 记录传入的额外属性
                 for key, value in attributes.items():
                     if value is not None:
                         span.set_attribute(key, value)

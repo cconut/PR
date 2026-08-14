@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import threading
 import uuid
 from typing import Any, Callable, Dict, List, Optional
@@ -62,6 +63,7 @@ class RegressionEvaluator:
     def __init__(self, reviewer_factory: Callable[[str], object]):
         self.reviewer_factory = reviewer_factory
 
+    # 用同一批冻结样本回放候选 Prompt；评分结果必须可复现，不能只依赖线上偶然表现。
     def run(self, prompt: str, cases: List[dict]) -> Dict[str, Any]:
         reviewer = self.reviewer_factory(prompt)
         reviewer_name = str(getattr(reviewer, "name", reviewer.__class__.__name__))
@@ -198,6 +200,7 @@ class EvolutionEngine:
     """Prompt evolution backed by replay evaluation, audit records and activation gates."""
 
     FORBIDDEN = ("ignore previous", "disable safety", "bypass", "直接执行生产")
+    FEEDBACK_RULE_ID = re.compile(r"^[A-Z][A-Z0-9_-]{1,79}$")
 
     def __init__(
         self, store, reviewer_factory: Optional[Callable[[str], object]] = None,
@@ -216,6 +219,7 @@ class EvolutionEngine:
         if seed_defaults:
             self._seed_default_cases()
 
+    # 初始化最小验证集，确保首次演化没有数据时也能明确知道门禁尚未就绪。
     def _seed_default_cases(self) -> None:
         for case in DEFAULT_EVALUATION_CASES:
             self.store.save_evaluation_case(
@@ -259,6 +263,7 @@ class EvolutionEngine:
                 raise ValueError("duplicate expected finding: %s:%s:%s" % identity)
             seen.add(identity)
 
+    # 新评测样本先校验结构和 split，再以不可变记录写入，避免候选版本篡改历史基准。
     def add_evaluation_case(
         self, name: str, diff: str, expected: list, split: str = "validation",
         source: str = "manual",
@@ -268,6 +273,7 @@ class EvolutionEngine:
         self.validate_case(name, diff, expected, split)
         return self.store.save_evaluation_case(name, split, diff, expected, source[:120], True)
 
+    # 演化前的静态安全门禁：命中危险指令即拒绝进入回放评测。
     def safety_evaluate(self, prompt: str) -> Dict[str, Any]:
         normalized = prompt.strip()
         lowered = normalized.lower()
@@ -282,6 +288,7 @@ class EvolutionEngine:
             "missing_terms": [token for token in required if token not in lowered],
         }
 
+    # 返回激活条件和数据集就绪度，供 API 与 Next 控制台展示，不泄露 holdout 细节。
     def status(self) -> Dict[str, Any]:
         cases = self.store.list_evaluation_cases("validation", True, self.max_cases)
         holdout = self.store.list_evaluation_cases("holdout", True, self.max_cases)
@@ -303,6 +310,7 @@ class EvolutionEngine:
             ),
         }
 
+    # 候选 Prompt 的受控入口：串行化同一 Skill 的演化，避免并发版本互相覆盖。
     def propose(
         self, skill_name: str, prompt: str, regression_score: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -312,6 +320,7 @@ class EvolutionEngine:
         with self._lock:
             return self._propose(skill_name, prompt, regression_score)
 
+    # 真正的激活门禁在这里执行：安全检查、验证集提升、holdout 非退化和审计留痕缺一不可。
     def _propose(
         self, skill_name: str, prompt: str, regression_score: Optional[float],
     ) -> Dict[str, Any]:
@@ -444,12 +453,16 @@ class EvolutionEngine:
             "run_id": run["id"],
         }
 
+    # 回滚只激活已有历史版本，不删除评测和审计记录。
     def rollback(self, skill_name: str, version: int) -> bool:
         with self._lock:
             return self.store.activate_skill_version(skill_name, version)
 
-    def auto_propose(self, skill_name: str = "llm-review") -> Dict[str, Any]:
-        cases = self.store.list_failure_cases(True, 100)
+    # 仅从已确认的失败类别和规则 ID 生成最小增量，任意反馈文本都不会被当作可执行指令。
+    def auto_propose(
+        self, skill_name: str = "llm-review", tenant_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        cases = self.store.list_failure_cases(True, 100, tenant_id)
         active = self.store.get_active_skill_version(skill_name)
         base = active["prompt"] if active else DEFAULT_PROMPT
         counts = {}
@@ -464,6 +477,24 @@ class EvolutionEngine:
             directives.append("Propose minimal fixes that preserve behavior and always include a regression test.")
         if counts.get("execution_error"):
             directives.append("Keep output valid JSON and follow the requested schema exactly.")
+        # A missed-issue feedback item may carry the reviewer rule identifier that a
+        # human confirmed.  Preserve that signal in the prompt without accepting
+        # arbitrary feedback text as an instruction.  The bracketed marker is both
+        # human-readable to an LLM and machine-auditable in offline replay.
+        learned_rule_ids = sorted({
+            str((case.get("payload", {}).get("finding") or {}).get("rule_id", "")).strip()
+            for case in cases
+            if case.get("category") == "missed_issue"
+        })
+        learned_rule_ids = [
+            rule_id for rule_id in learned_rule_ids
+            if self.FEEDBACK_RULE_ID.fullmatch(rule_id)
+        ]
+        directives.extend(
+            "Explicitly check added lines for confirmed rule %s [focus-rule:%s]."
+            % (rule_id, rule_id)
+            for rule_id in learned_rule_ids
+        )
         additions = [directive for directive in directives if directive.lower() not in base.lower()]
         if not additions:
             return {
@@ -485,6 +516,7 @@ class EvolutionEngine:
         result = self.propose(skill_name, candidate)
         result["failure_cases_used"] = len(cases)
         result["learned_categories"] = counts
+        result["learned_rule_ids"] = learned_rule_ids
         if result["decision"] == "activated":
             self.store.resolve_failure_cases([case["id"] for case in cases])
         return result

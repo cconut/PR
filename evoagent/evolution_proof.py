@@ -1,3 +1,4 @@
+# Added: reproducible offline evidence for prompt-evolution decisions.
 """Auditable offline proof for feedback-driven prompt evolution.
 
 This module deliberately uses a deterministic prompt-policy reviewer.  It proves

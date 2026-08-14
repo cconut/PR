@@ -1,42 +1,34 @@
 import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
-from evoagent.config import Settings
+from evoagent.config import load_dotenv
 
 
-class SettingsTests(unittest.TestCase):
-    def test_resolves_siliconflow_defaults(self):
-        with patch.dict(
-            os.environ,
-            {
-                "EVOAGENT_LLM_PROVIDER": "siliconflow",
-                "EVOAGENT_SILICONFLOW_API_KEY": "test-key",
-                "EVOAGENT_LLM_BASE_URL": "",
-                "EVOAGENT_LLM_MODEL": "",
-            },
-            clear=False,
-        ):
-            config = Settings.from_env().resolved_llm()
+class DotenvTests(unittest.TestCase):
+    def test_loads_valid_assignments_and_quoted_values(self):
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+            handle.write("# comment\n")
+            handle.write("export EVOAGENT_LLM_PROVIDER=deepseek\n")
+            handle.write('EVOAGENT_DEEPSEEK_API_KEY="test-key"\n')
+            handle.write("invalid line\n")
+            path = handle.name
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                load_dotenv([path])
+                self.assertEqual("deepseek", os.environ["EVOAGENT_LLM_PROVIDER"])
+                self.assertEqual("test-key", os.environ["EVOAGENT_DEEPSEEK_API_KEY"])
+        finally:
+            os.unlink(path)
 
-        self.assertEqual("siliconflow", config["provider"])
-        self.assertEqual("https://api.siliconflow.cn/v1", config["base_url"])
-        self.assertEqual("deepseek-ai/DeepSeek-V3", config["model"])
-        self.assertEqual("test-key", config["api_key"])
-
-    def test_siliconflow_requires_api_key(self):
-        with patch.dict(
-            os.environ,
-            {
-                "EVOAGENT_LLM_PROVIDER": "siliconflow",
-                "EVOAGENT_SILICONFLOW_API_KEY": "",
-                "EVOAGENT_LLM_API_KEY": "",
-            },
-            clear=False,
-        ):
-            with self.assertRaisesRegex(ValueError, "SiliconFlow requires"):
-                Settings.from_env().resolved_llm()
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_process_environment_has_priority(self):
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+            handle.write("EVOAGENT_LLM_PROVIDER=deepseek\n")
+            path = handle.name
+        try:
+            with patch.dict(os.environ, {"EVOAGENT_LLM_PROVIDER": "custom"}, clear=True):
+                load_dotenv([path])
+                self.assertEqual("custom", os.environ["EVOAGENT_LLM_PROVIDER"])
+        finally:
+            os.unlink(path)

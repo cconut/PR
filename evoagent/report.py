@@ -15,6 +15,23 @@ def to_markdown(report: Dict[str, Any]) -> str:
         report.get("summary", ""),
         "",
     ]
+    collaboration = report.get("collaboration") or {}
+    if collaboration:
+        lines.extend([
+            "## Multi-agent collaboration",
+            "",
+            "- Protocol: `%s`" % collaboration.get("protocol", "unknown"),
+            "- Assignments: `%s`; dialogue rounds: `%s`; messages: `%s`" % (
+                collaboration.get("planned_assignments", 0),
+                collaboration.get("dialogue_rounds", 0),
+                collaboration.get("messages", 0),
+            ),
+            "- Retries: `%s`; handoffs: `%s`; rejected by verification: `%s`" % (
+                collaboration.get("retries", 0), collaboration.get("handoffs", 0),
+                collaboration.get("rejected_findings", 0),
+            ),
+            "",
+        ])
     findings = report.get("findings", [])
     if not findings:
         lines.append("✅ No actionable issue detected in the added lines.")
@@ -45,4 +62,3 @@ def to_markdown(report: Dict[str, Any]) -> str:
             ]
         )
     return "\n".join(lines) + "\n"
-

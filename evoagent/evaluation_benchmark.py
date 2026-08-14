@@ -59,7 +59,7 @@ def baseline_reviewer() -> Reviewer:
 def candidate_reviewer() -> Reviewer:
     return MultiAgentCoordinator([LocalRuleReviewer(), ContextRuleReviewer()])
 
-
+# 40道风险题
 def _risk_scenarios() -> List[dict]:
     scenarios = []
 
@@ -208,7 +208,7 @@ def _risk_source(scenario: dict) -> Tuple[str, str, str]:
         )
     return before, after, line.strip()
 
-
+# 60道干净题
 def _clean_source(index: int) -> Tuple[str, str]:
     before = "def process(value):\n    return value\n"
     if index < 5:
@@ -237,13 +237,14 @@ def _unified_diff(path: str, before: str, after: str) -> str:
         n=3,
     ))
 
-
+# 生成100个可复现的PR-like diff
 def generate_controlled_pr_cases() -> List[dict]:
     """Generate 100 reproducible PR-like diffs.
 
     These are deliberately labelled synthetic-controlled. They are useful for testing
     the harness, not for making claims about production performance on public PRs.
     """
+    # 生成10个仓库
     repositories = ["acme/service-%02d" % number for number in range(1, 11)]
     by_repo: Dict[str, List[dict]] = {repository: [] for repository in repositories}
     scenarios = _risk_scenarios()

@@ -1,8 +1,10 @@
+import hashlib
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 
 from .models import ReviewReport, TaskState, TraceEvent
 
@@ -17,12 +19,23 @@ class TaskStore:
         self._lock = threading.Lock()
         self._init()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        # 每个存储操作独占短连接并显式提交、回滚和关闭，避免 Windows 上测试库残留锁。
         conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            # Added: close every short-lived SQLite handle so Windows can release test databases.
+            conn.close()
 
     def _init(self) -> None:
+        # 初始化与增量迁移共用这里；只追加兼容列，不依赖破坏性 schema 重建。
         with self._connect() as conn:
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS tasks (
@@ -102,6 +115,41 @@ class TaskStore:
                     metrics_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS skill_artifact_versions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    skill_name TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    artifact_json TEXT NOT NULL,
+                    artifact_sha256 TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 0,
+                    parent_version INTEGER,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(tenant_id, skill_name, version)
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS skill_evolution_runs (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    skill_name TEXT NOT NULL,
+                    candidate_version INTEGER NOT NULL,
+                    baseline_version INTEGER,
+                    decision TEXT NOT NULL,
+                    candidate_score REAL NOT NULL,
+                    baseline_score REAL NOT NULL,
+                    metrics_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            self._ensure_column(
+                conn, "skill_artifact_versions", "tenant_id", "TEXT NOT NULL DEFAULT 'default'"
+            )
+            self._ensure_column(
+                conn, "skill_evolution_runs", "tenant_id", "TEXT NOT NULL DEFAULT 'default'"
             )
             self._ensure_column(conn, "tasks", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
             self._ensure_column(conn, "tasks", "cancel_requested", "INTEGER NOT NULL DEFAULT 0")
@@ -244,7 +292,28 @@ class TaskStore:
                     UNIQUE(tenant_id, alert_key, status)
                 )"""
             )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS agent_memories (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    repository TEXT NOT NULL,
+                    task_id TEXT NOT NULL DEFAULT '',
+                    agent TEXT NOT NULL DEFAULT '',
+                    scope TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    keywords_json TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    importance REAL NOT NULL DEFAULT 0.5,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT
+                )"""
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant_created ON tasks(tenant_id, created_at)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_agent_memories_lookup "
+                "ON agent_memories(tenant_id, repository, scope, created_at)"
+            )
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
@@ -256,6 +325,7 @@ class TaskStore:
         self, task_id: str, repository: str, pull_request: Optional[int],
         payload: Dict[str, Any], tenant_id: str = "default",
     ) -> None:
+        # 创建任务时只记录可审计输入元数据；完整 diff 由 task_payloads 单独保存。
         now = utc_now()
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -267,6 +337,7 @@ class TaskStore:
             )
 
     def transition(self, task_id: str, event: TraceEvent) -> None:
+        # 状态值和 trace event 必须在同一事务中落库，保证任务状态可由审计轨迹重建。
         with self._lock, self._connect() as conn:
             conn.execute(
                 "UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?",
@@ -338,6 +409,77 @@ class TaskStore:
                  json.dumps(message.get("content", {}), ensure_ascii=False), utc_now()),
             )
 
+    def save_agent_memory(self, memory: Dict[str, Any]) -> Dict[str, Any]:
+        # 工作记忆按 id 幂等写入；冲突时只提升重要性或刷新过期时间，避免低价值内容覆盖高价值证据。
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO agent_memories(id,tenant_id,repository,task_id,agent,scope,kind,"
+                "content,keywords_json,metadata_json,importance,created_at,expires_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                "importance=MAX(agent_memories.importance,excluded.importance),"
+                "expires_at=excluded.expires_at",
+                (
+                    memory["id"], memory["tenant_id"], memory["repository"],
+                    memory.get("task_id", ""), memory.get("agent", ""), memory["scope"],
+                    memory["kind"], memory["content"],
+                    json.dumps(memory.get("keywords", []), ensure_ascii=False),
+                    json.dumps(memory.get("metadata", {}), ensure_ascii=False),
+                    float(memory.get("importance", 0.5)), memory["created_at"],
+                    memory.get("expires_at"),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM agent_memories WHERE id=?", (memory["id"],)
+            ).fetchone()
+        return self._memory_from_row(row)
+
+    def list_agent_memories(
+        self, tenant_id: str, repository: str, scopes: tuple,
+        limit: int = 100,
+    ) -> list:
+        placeholders = ",".join("?" for _ in scopes)
+        params = [tenant_id, repository, *scopes, utc_now(), max(1, min(limit, 500))]
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM agent_memories WHERE tenant_id=? AND repository=? "
+                "AND scope IN (%s) AND (expires_at IS NULL OR expires_at>?) "
+                "ORDER BY importance DESC,created_at DESC LIMIT ?" % placeholders,
+                params,
+            ).fetchall()
+        return [self._memory_from_row(row) for row in rows]
+
+    def delete_agent_memories(self, task_id: str = "", scope: str = "") -> int:
+        clauses = []
+        params = []
+        if task_id:
+            clauses.append("task_id=?")
+            params.append(task_id)
+        if scope:
+            clauses.append("scope=?")
+            params.append(scope)
+        if not clauses:
+            raise ValueError("memory deletion requires task_id or scope")
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM agent_memories WHERE " + " AND ".join(clauses), params
+            )
+            return cursor.rowcount
+
+    def purge_expired_agent_memories(self) -> int:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM agent_memories WHERE expires_at IS NOT NULL AND expires_at<=?",
+                (utc_now(),),
+            )
+            return cursor.rowcount
+
+    @staticmethod
+    def _memory_from_row(row) -> Dict[str, Any]:
+        value = dict(row)
+        value["keywords"] = json.loads(value.pop("keywords_json"))
+        value["metadata"] = json.loads(value.pop("metadata_json"))
+        return value
+
     def list_tasks(self, limit: int = 50, tenant_id: Optional[str] = None) -> list:
         with self._connect() as conn:
             if tenant_id is None:
@@ -377,6 +519,28 @@ class TaskStore:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY f.id DESC LIMIT ?"
         params.append(max(1, min(limit, 500)))
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json"))
+            values.append(item)
+        return values
+
+    def list_task_failure_cases(
+        self, task_id: str, tenant_id: Optional[str] = None,
+    ) -> list:
+        query = "SELECT f.* FROM failure_cases f"
+        params = []
+        if tenant_id is not None:
+            query += " JOIN tasks t ON t.id=f.task_id"
+            query += " WHERE f.task_id=? AND t.tenant_id=?"
+            params.extend([task_id, tenant_id])
+        else:
+            query += " WHERE f.task_id=?"
+            params.append(task_id)
+        query += " ORDER BY f.id DESC"
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         values = []
@@ -525,6 +689,138 @@ class TaskStore:
             )
         return True
 
+    def save_skill_artifact(
+        self, skill_name: str, artifact: Dict[str, Any], score: float,
+        activate: bool = False, tenant_id: str = "default",
+    ) -> Dict[str, Any]:
+        # 声明式 Skill 连同内容哈希、版本和激活状态持久化，版本切换由同一事务保证唯一激活项。
+        artifact_json = json.dumps(
+            artifact, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        artifact_sha256 = hashlib.sha256(artifact_json.encode("utf-8")).hexdigest()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(version),0) AS version FROM skill_artifact_versions "
+                "WHERE tenant_id=? AND skill_name=?", (tenant_id, skill_name),
+            ).fetchone()
+            version = int(row["version"]) + 1
+            parent = conn.execute(
+                "SELECT version FROM skill_artifact_versions WHERE tenant_id=? AND skill_name=? "
+                "AND active=1 ORDER BY version DESC LIMIT 1", (tenant_id, skill_name),
+            ).fetchone()
+            if activate:
+                conn.execute(
+                    "UPDATE skill_artifact_versions SET active=0 WHERE tenant_id=? AND skill_name=?",
+                    (tenant_id, skill_name),
+                )
+            created_at = utc_now()
+            conn.execute(
+                "INSERT INTO skill_artifact_versions(tenant_id,skill_name,version,artifact_json,"
+                "artifact_sha256,score,active,parent_version,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (tenant_id, skill_name, version, artifact_json, artifact_sha256, float(score),
+                 int(activate), parent["version"] if parent else None, created_at),
+            )
+        return {
+            "tenant_id": tenant_id, "skill_name": skill_name, "version": version, "score": float(score),
+            "active": activate, "parent_version": parent["version"] if parent else None,
+            "artifact_sha256": artifact_sha256, "created_at": created_at,
+        }
+
+    @staticmethod
+    def _decode_skill_artifact(row) -> Dict[str, Any]:
+        value = dict(row)
+        value["artifact"] = json.loads(value.pop("artifact_json"))
+        value["active"] = bool(value["active"])
+        return value
+
+    def get_active_skill_artifact(
+        self, skill_name: str, tenant_id: str = "default",
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM skill_artifact_versions WHERE tenant_id=? AND skill_name=? "
+                "AND active=1 ORDER BY version DESC LIMIT 1", (tenant_id, skill_name),
+            ).fetchone()
+        return self._decode_skill_artifact(row) if row else None
+
+    def list_active_skill_artifacts(self, tenant_id: str = "default") -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM skill_artifact_versions WHERE tenant_id=? AND active=1 "
+                "ORDER BY skill_name", (tenant_id,)
+            ).fetchall()
+        return [self._decode_skill_artifact(row) for row in rows]
+
+    def list_skill_artifact_versions(
+        self, skill_name: str, tenant_id: str = "default",
+    ) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM skill_artifact_versions WHERE tenant_id=? AND skill_name=? "
+                "ORDER BY version DESC", (tenant_id, skill_name),
+            ).fetchall()
+        return [self._decode_skill_artifact(row) for row in rows]
+
+    def activate_skill_artifact(
+        self, skill_name: str, version: int, tenant_id: str = "default",
+    ) -> bool:
+        with self._lock, self._connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM skill_artifact_versions v WHERE v.tenant_id=? "
+                "AND v.skill_name=? AND v.version=? AND (v.active=1 OR EXISTS ("
+                "SELECT 1 FROM skill_evolution_runs r WHERE r.tenant_id=v.tenant_id "
+                "AND r.skill_name=v.skill_name AND r.candidate_version=v.version "
+                "AND r.decision='activated'))",
+                (tenant_id, skill_name, version),
+            ).fetchone()
+            if not exists:
+                return False
+            conn.execute(
+                "UPDATE skill_artifact_versions SET active=0 WHERE tenant_id=? AND skill_name=?",
+                (tenant_id, skill_name),
+            )
+            conn.execute(
+                "UPDATE skill_artifact_versions SET active=1 WHERE tenant_id=? AND skill_name=? "
+                "AND version=?", (tenant_id, skill_name, version),
+            )
+        return True
+
+    def save_skill_evolution_run(self, run: Dict[str, Any]) -> Dict[str, Any]:
+        # 每次 Skill 演化留存输入、评估结果和决策，方便审计“为何激活或拒绝”。
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO skill_evolution_runs(id,tenant_id,skill_name,candidate_version,baseline_version,"
+                "decision,candidate_score,baseline_score,metrics_json,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (run["id"], run.get("tenant_id", "default"), run["skill_name"], run["candidate_version"],
+                 run.get("baseline_version"), run["decision"], run["candidate_score"],
+                 run["baseline_score"], json.dumps(run["metrics"], ensure_ascii=False),
+                 run["created_at"]),
+            )
+        return run
+
+    def list_skill_evolution_runs(
+        self, limit: int = 50, tenant_id: Optional[str] = None,
+    ) -> list:
+        with self._connect() as conn:
+            if tenant_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM skill_evolution_runs ORDER BY created_at DESC LIMIT ?",
+                    (max(1, min(limit, 200)),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM skill_evolution_runs WHERE tenant_id=? "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (tenant_id, max(1, min(limit, 200))),
+                ).fetchall()
+        values = []
+        for row in rows:
+            value = dict(row)
+            value["metrics"] = json.loads(value.pop("metrics_json"))
+            values.append(value)
+        return values
+
     def save_installation(
         self, installation_id: int, account_login: str, tenant_id: str = "default"
     ) -> None:
@@ -546,6 +842,7 @@ class TaskStore:
         self, task_id: str, node: str, state: Dict[str, Any], status: str = "completed",
         attempt: int = 1, error: str = "",
     ) -> None:
+        # 节点检查点允许恢复任务跳过已完成步骤；失败原因和尝试次数也一并保存用于诊断。
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO checkpoints(task_id,node,status,attempt,state_json,error,updated_at) "
@@ -598,6 +895,7 @@ class TaskStore:
         return str(row["diff"]) if row else None
 
     def request_cancel(self, task_id: str, tenant_id: Optional[str] = None) -> bool:
+        # 取消是协作式请求：运行时会在每个节点预算检查中读取该标记并安全停止。
         query = "UPDATE tasks SET cancel_requested=1,updated_at=? WHERE id=?"
         params = [utc_now(), task_id]
         if tenant_id is not None:
@@ -905,7 +1203,18 @@ class TaskStore:
                     "SELECT COUNT(*) AS n FROM failure_cases f JOIN tasks t ON t.id=f.task_id "
                     "WHERE f.resolved=0 AND t.tenant_id=?", (tenant_id,)
                 ).fetchone()["n"]
-            active_skills = conn.execute("SELECT COUNT(*) AS n FROM skill_versions WHERE active = 1").fetchone()["n"]
+            active_skills = conn.execute(
+                "SELECT COUNT(*) AS n FROM skill_versions WHERE active = 1"
+            ).fetchone()["n"]
+            if tenant_id is None:
+                active_skills += conn.execute(
+                    "SELECT COUNT(*) AS n FROM skill_artifact_versions WHERE active=1"
+                ).fetchone()["n"]
+            else:
+                active_skills += conn.execute(
+                    "SELECT COUNT(*) AS n FROM skill_artifact_versions "
+                    "WHERE tenant_id=? AND active=1", (tenant_id,)
+                ).fetchone()["n"]
         return {
             "tasks_total": total, "tasks_success": success, "tasks_failed": failed,
             "success_rate": round(success / total, 4) if total else 0.0,

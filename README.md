@@ -11,7 +11,7 @@
 - 独立分支上的保守型自动修复提交
 - PostgreSQL、Redis 生产模式
 - 失败案例回流、提示词评测、版本激活与回滚
-- LangGraph 节点编排、持久化 checkpoint 与任务断点续跑
+- 外层任务 Runtime 的持久化 checkpoint/断点续跑，以及内层 LangGraph 多 Agent 节点编排
 - Redis Streams ACK、Worker 租约、指数退避重试和死信队列
 - Webhook delivery 幂等、重放时间窗与评论 upsert
 - 用户登录、RBAC、租户/仓库隔离和不可变管理审计
@@ -236,6 +236,17 @@ Compose 会启动 PostgreSQL、Redis 和 EvoAgent。未配置这两项时，项�
 
 Compose 同时启动 Next.js 控制台，访问 `http://127.0.0.1:3000/`；Python API 仍位于 `http://127.0.0.1:8080/`。
 
+## Backend Fusion
+
+The Next.js console in `web/` remains the primary UI and continues to proxy
+`/api`, `/v1`, `/github`, and `/webhooks` to the Python service. The backend
+uses a task-level runtime for checkpoint/resume/budget control and a LangGraph
+collaboration graph for multi-agent orchestration. It also adds context
+compression, tenant-scoped memory, and replay-gated declarative skill
+evolution. The Skill page exposes the new evolution status, candidate history,
+automatic proposals, and version activation without replacing the existing
+console.
+
 ## API
 
 | 方法 | 路径 | 说明 |
@@ -276,11 +287,11 @@ HTTP / GitHub Webhook
  ReviewService ── TaskStore(SQLite / PostgreSQL)
         │
         ▼
- ReviewHarness (LangGraph / checkpoint / resume / budget / trace)
+ ReviewHarness (task runtime / checkpoint / resume / budget / trace)
         │
         ├── DiffParser
         ├── Redis Streams / ACK / lease / retry / DLQ
-        └── MultiAgentCoordinator
+        └── MultiAgentCoordinator (LangGraph)
               ├── Security Agent
               ├── Reliability Agent
               ├── OpenAI-compatible Agent
